@@ -7,6 +7,17 @@ cache/*.json
 # MCP config (contains local paths)
 .mcp.json
 
+# Environment variables
+.env
+.env.*
+
+# Virtual environments
+venv/
+.venv/
+
+# Logs
+*.log
+
 # Cloned reference repo
 MediaCrawler/
 
