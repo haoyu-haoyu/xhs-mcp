@@ -1,0 +1,16 @@
+[project]
+name = "xhs-mcp"
+version = "0.1.0"
+description = "XHS (Xiaohongshu) MCP Server - 小红书智能查询分析系统"
+authors = [{ name = "Wang" }]
+license = { text = "Non-Commercial Learning Use Only" }
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "playwright>=1.40.0",
+    "httpx>=0.25.0",
+    "tenacity>=8.2.0",
+]
+
+[project.scripts]
+xhs-mcp = "server:main"

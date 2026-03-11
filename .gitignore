@@ -1,0 +1,26 @@
+# Cookies & sessions (SENSITIVE)
+config/cookies.json
+
+# Cache data (contains user data)
+cache/*.json
+
+# MCP config (contains local paths)
+.mcp.json
+
+# Cloned reference repo
+MediaCrawler/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
