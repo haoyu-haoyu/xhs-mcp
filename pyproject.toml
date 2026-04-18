@@ -6,11 +6,58 @@ authors = [{ name = "Wang" }]
 license = { text = "Non-Commercial Learning Use Only" }
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0.0",
-    "playwright>=1.40.0",
-    "httpx>=0.25.0",
-    "tenacity>=8.2.0",
+    "mcp>=1.0.0,<2.0.0",
+    "playwright>=1.40.0,<2.0.0",
+    "httpx>=0.25.0,<1.0.0",
+    "tenacity>=8.2.0,<10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9.0",
+    "pytest-asyncio>=0.23.0,<2.0.0",
+    "ruff>=0.4.0,<1.0.0",
+    "mypy>=1.8.0,<2.0.0",
 ]
 
 [project.scripts]
 xhs-mcp = "server:main"
+
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Flat layout with a top-level server.py module + two packages:
+#   - xhs/    : main application code (plus stealth.min.js as data)
+#   - config/ : settings constants (imported by xhs.browser / xhs.client)
+# The runtime cache/ dir is not a Python package and is created on
+# demand at runtime, so it is intentionally omitted here.
+py-modules = ["server"]
+packages = ["xhs", "config"]
+
+[tool.setuptools.package-data]
+# stealth.min.js is loaded at runtime by xhs.browser.start to bypass
+# headless-browser detection; it must ship inside the wheel.
+xhs = ["stealth.min.js"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Keep it minimal — just the widely-agreed-on bug-finders.
+# pycodestyle errors (E), pyflakes (F), bugbear (B).  Skip the pyupgrade
+# rules (UP) for now: the codebase uses ``typing.Dict`` / ``typing.Optional``
+# extensively and a stylistic rewrite is out of scope for the PR that
+# adds CI.  A follow-up PR can flip ``select = [..., "UP"]`` once the
+# existing annotations are normalized.
+select = ["E", "F", "W", "B"]
+ignore = [
+    "E501",   # line length enforced by formatter, not linter
+    "B008",   # function calls in default args — common with Pydantic / dataclasses
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
