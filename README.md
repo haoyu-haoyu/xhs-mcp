@@ -159,22 +159,39 @@ xhs_login(action="cookie_str", cookie_str="你的cookie字符串")
 
 所有工具支持 `force_refresh: true` 绕过缓存获取最新数据。缓存文件存储在 `cache/` 目录，不会被上传到 Git。
 
+## ⚠️ 安全说明：Cookie 以明文存储
+
+登录成功后，小红书 Cookie 会被写入 `config/cookies.json` 明文 JSON 文件。这些 Cookie **等同于你的账号凭证**——谁拿到它们就能以你的身份操作账号。
+
+本仓库的缓解措施：
+- 写入时文件权限设为 `0600`（仅当前用户可读写，POSIX 系统）
+- 加载时会检测并纠正过宽的权限
+- `.gitignore` 已排除 `config/cookies.json`，不会被意外提交
+
+**但你仍然需要注意：**
+- **共享电脑**（实验室 / 公用设备 / 云沙盒）上不要使用本工具，root 用户仍可读取
+- **备份 / 同步工具**（iCloud Drive、Dropbox、Time Machine）可能把明文 Cookie 复制到其他地方
+- **Windows 上 `os.chmod()` 只能切换只读位**，其他 Unix 权限位被忽略；真正的访问控制来自 NTFS ACL，需要你手动在资源管理器里限制文件权限
+
+⚠️ **注意**：`xhs_login` 的 `cookie_str` 方式**仍会把导入的 Cookie 写入 `config/cookies.json`**（目前没有纯内存模式）。无论你从哪里读取 cookie 字符串，只要调用这个工具，都会落盘到本机。如果完全不想落盘，需要自行 patch `xhs/login.py` 里的 `login_by_cookie_str`，去掉 `save_cookies_to_cache()` 调用。
+
 ## 项目结构
 
-```
+```text
 xhs-mcp/
 ├── server.py              # MCP Server 入口，注册工具和调度
 ├── xhs/
+│   ├── handlers.py        # 5 个 MCP 工具的业务逻辑（可单测）
 │   ├── client.py          # XHS API 客户端（签名 + 请求）
 │   ├── sign.py            # 请求签名（X-S, X-T, x-S-Common）
 │   ├── browser.py         # Playwright 浏览器管理
 │   ├── login.py           # 登录流程（QR 码 / Cookie 导入）
 │   ├── cache.py           # 文件缓存系统
-│   └── models.py          # 数据模型与异常定义
+│   ├── models.py          # 数据模型与异常定义
+│   └── stealth.min.js     # 反无头浏览器检测脚本（随 wheel 一起发布）
 ├── config/
 │   └── settings.py        # 配置常量
-├── libs/
-│   └── stealth.min.js     # 反无头浏览器检测脚本
+├── tests/                 # 单元测试（pytest + pytest-asyncio）
 ├── SKILL.md               # Claude Code Skill 定义
 └── pyproject.toml
 ```

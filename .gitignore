@@ -35,3 +35,5 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+.venv-test/
+__pycache__/

@@ -161,17 +161,46 @@ class XHSClient:
     # ── Public API methods ──
 
     async def pong(self) -> bool:
-        """Check if current login session is valid."""
+        """Check if current login session is valid.
+
+        Returns ``False`` on any reachable-but-invalid response (HTTP
+        non-200, missing success flag, transport failure, bad JSON).
+        Unexpected exceptions propagate so callers notice genuinely
+        broken state (e.g. browser context closed, signing broken) —
+        those would otherwise masquerade as "session expired" and hide
+        real bugs.
+        """
         try:
             uri = "/api/sns/web/v1/user/selfinfo"
             headers = await self._pre_headers(uri, params={})
             async with httpx.AsyncClient() as client:
-                response = await client.get(f"{self._host}{uri}", headers=headers, timeout=self._timeout)
+                response = await client.get(
+                    f"{self._host}{uri}",
+                    headers=headers,
+                    timeout=self._timeout,
+                )
             if response.status_code == 200:
                 result = response.json()
-                return bool(result.get("data", {}).get("result", {}).get("success"))
-        except Exception as e:
-            logger.warning(f"Login check failed: {e}")
+                # Defensive against payloads where nested fields are None
+                # OR the wrong type — e.g. {"data": null}, {"data": []}, or
+                # {"data": "some string"} would otherwise raise
+                # AttributeError on the chained .get() and surface as
+                # internal_error in xhs_login(check) instead of "expired".
+                # `or {}` alone handles None/[] (falsy), but a truthy
+                # non-dict (e.g. a populated list) still has no .get().
+                if not isinstance(result, dict):
+                    return False
+                data = result.get("data")
+                if not isinstance(data, dict):
+                    return False
+                inner = data.get("result")
+                if not isinstance(inner, dict):
+                    return False
+                return bool(inner.get("success"))
+        except (httpx.HTTPError, ValueError) as e:
+            # httpx.HTTPError covers connect/read/timeout; ValueError covers
+            # response.json() on malformed payloads.
+            logger.warning(f"Login check failed: {type(e).__name__}: {e}")
         return False
 
     async def search_notes(
@@ -289,6 +318,17 @@ class XHSClient:
             if not comments:
                 break
 
+            # Drop null / non-dict slots BEFORE trimming and extending.
+            # XHS occasionally returns `{"comments": [None, ...]}`; keeping
+            # None entries would (a) consume a max_count slot, (b) leak
+            # non-dicts into the List[Dict] return type, and (c) make
+            # `comment.get(...)` raise AttributeError further down,
+            # aborting the whole detail fetch instead of degrading
+            # per-note.
+            comments = [c for c in comments if isinstance(c, dict)]
+            if not comments:
+                break
+
             # Trim to max_count
             remaining = max_count - len(result)
             comments = comments[:remaining]
@@ -306,16 +346,39 @@ class XHSClient:
                         sub_res = await self.get_note_sub_comments(
                             note_id, root_id, xsec_token, cursor=sub_cursor,
                         )
-                        if not sub_res:
+                        if not sub_res or not isinstance(sub_res, dict):
                             break
                         sub_has_more = sub_res.get("has_more", False)
                         sub_cursor = sub_res.get("cursor", "")
-                        new_subs = sub_res.get("comments", [])
+                        new_subs = sub_res.get("comments") or []
                         if not new_subs:
                             break
                         sub_comments.extend(new_subs)
-                    except Exception as e:
-                        logger.warning(f"Failed to get sub-comments for {root_id}: {e}")
+                    except (
+                        httpx.HTTPError,
+                        ValueError,
+                        KeyError,
+                        AttributeError,
+                        TypeError,
+                        RuntimeError,
+                    ) as e:
+                        # Paginated fetch failure on a single sub-comment page
+                        # stops the sub-walk but the outer comment is kept with
+                        # whatever pages we already have.  AttributeError /
+                        # TypeError guard against unexpected shapes returned
+                        # by XHS (e.g. a list instead of a dict); RuntimeError
+                        # covers sign_request() failing on a stale page — we'd
+                        # rather drop sub-comments than abort the whole detail
+                        # fetch.  Mark the parent comment as partial so the
+                        # caller knows not to cache this as a final "complete"
+                        # result; otherwise one transient signing blip would
+                        # pin truncated sub-comments for the full xhs_detail
+                        # TTL.
+                        logger.warning(
+                            f"Failed to get sub-comments for {root_id}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        comment["_sub_comments_partial"] = True
                         break
 
                 comment["sub_comments"] = sub_comments
@@ -342,8 +405,8 @@ class XHSClient:
                     timeout=self._timeout,
                 )
                 html = response.text
-        except Exception as e:
-            logger.error(f"Failed to fetch creator page: {e}")
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to fetch creator page: {type(e).__name__}: {e}")
             return None
 
         return self._extract_creator_from_html(html)
@@ -386,8 +449,14 @@ class XHSClient:
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse __INITIAL_STATE__ JSON: {e}")
             return None
-        except Exception as e:
-            logger.error(f"Unexpected error extracting creator info: {e}")
+        except (AttributeError, KeyError, TypeError, ValueError) as e:
+            # Structure-of-object surprises (missing attrs, wrong types,
+            # unexpected value shapes) — log + return None so caller can
+            # mark profile_error.  Anything else (e.g. a logic bug)
+            # propagates to the MCP layer's last-resort catch.
+            logger.error(
+                f"Structural error extracting creator info: {type(e).__name__}: {e}"
+            )
             return None
 
     async def get_notes_by_creator(

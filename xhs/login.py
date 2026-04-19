@@ -8,13 +8,25 @@
 
 import asyncio
 import logging
-from typing import Optional
 
-from playwright.async_api import BrowserContext, Page
+from playwright.async_api import (
+    BrowserContext,
+    Page,
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 from .browser import BrowserManager, convert_str_cookie_to_dict
 
 logger = logging.getLogger("xhs-mcp")
+
+# Selector-probing helpers below catch Playwright's exceptions rather than
+# bare `Exception`.  A TimeoutError is expected (the selector isn't on
+# this page yet); other PlaywrightErrors usually mean the element exists
+# but isn't actionable (detached, hidden, navigated away).  In both
+# cases the intended behaviour is "try the next selector", but we log
+# at DEBUG so troubleshooters can see what got rejected and why.
+_EXPECTED_PROBE_ERRORS = (PlaywrightTimeoutError, PlaywrightError)
 
 # Multiple selectors to try, in order of preference.
 # XHS updates their frontend frequently so we need fallbacks.
@@ -43,7 +55,8 @@ async def _find_and_click(page: Page, selectors: list[str], timeout: int = 5000)
                 await loc.click(timeout=timeout)
                 logger.info(f"Clicked element: {sel}")
                 return True
-        except Exception:
+        except _EXPECTED_PROBE_ERRORS as e:
+            logger.debug(f"Selector '{sel}' not clickable: {type(e).__name__}: {e}")
             continue
     return False
 
@@ -55,7 +68,8 @@ async def _wait_for_any(page: Page, selectors: list[str], timeout: int = 10000) 
             await page.wait_for_selector(sel, timeout=timeout)
             logger.info(f"Found element: {sel}")
             return True
-        except Exception:
+        except _EXPECTED_PROBE_ERRORS as e:
+            logger.debug(f"Selector '{sel}' did not appear: {type(e).__name__}: {e}")
             continue
     return False
 
@@ -77,7 +91,8 @@ async def check_login_state(
         if elapsed % 15 == 0 and elapsed > 0:
             logger.info(f"Still waiting for login... ({elapsed}s / {timeout_seconds}s)")
 
-        # Check 1: UI element - profile link in sidebar
+        # Check 1: UI element - profile link in sidebar.  Probe is allowed
+        # to miss silently (timeout/detached element) while polling.
         try:
             profile_selectors = [
                 "xpath=//a[contains(@href, '/user/profile/')]//span[text()='我']",
@@ -88,10 +103,13 @@ async def check_login_state(
                 if await context_page.is_visible(sel, timeout=500):
                     logger.info("Login confirmed via UI element.")
                     return True
-        except Exception:
-            pass
+        except _EXPECTED_PROBE_ERRORS as e:
+            logger.debug(f"Profile-selector probe failed: {type(e).__name__}: {e}")
 
-        # Check 2: Cookie-based detection - web_session changed
+        # Check 2: Cookie-based detection - web_session changed.  Only
+        # treat Playwright errors as "try again next tick"; any other
+        # error (e.g. the context was closed out from under us) should
+        # propagate so the caller notices.
         try:
             current_cookies = await browser_context.cookies()
             _, cookie_dict = _convert_cookies(current_cookies)
@@ -99,8 +117,8 @@ async def check_login_state(
             if current_session and current_session != no_logged_in_session:
                 logger.info("Login confirmed via cookie change.")
                 return True
-        except Exception:
-            pass
+        except PlaywrightError as e:
+            logger.debug(f"Cookie read transient failure: {type(e).__name__}: {e}")
 
         await asyncio.sleep(1)
 
@@ -118,7 +136,9 @@ async def login_by_qrcode(browser_mgr: BrowserManager) -> bool:
 
     logger.info("Starting QR code login flow...")
 
-    # Dismiss any cookie consent popup first
+    # Dismiss any cookie consent popup first.  We iterate best-effort;
+    # any Playwright error (no match, element detached, iframe nav)
+    # means "nothing to dismiss" — not a real failure.
     try:
         for btn_text in ["Accept all cookies", "接受所有", "全部接受", "同意"]:
             loc = page.locator(f'button:text("{btn_text}")')
@@ -127,8 +147,8 @@ async def login_by_qrcode(browser_mgr: BrowserManager) -> bool:
                 logger.info(f"Dismissed popup: {btn_text}")
                 await asyncio.sleep(1)
                 break
-    except Exception:
-        pass
+    except _EXPECTED_PROBE_ERRORS as e:
+        logger.debug(f"Cookie popup dismiss skipped: {type(e).__name__}: {e}")
 
     # Step 1: Try to find QR code directly (maybe login dialog auto-popped)
     qrcode_found = await _wait_for_any(page, _QRCODE_IMG_SELECTORS, timeout=3000)
@@ -141,15 +161,21 @@ async def login_by_qrcode(browser_mgr: BrowserManager) -> bool:
             await asyncio.sleep(2)
             qrcode_found = await _wait_for_any(page, _QRCODE_IMG_SELECTORS, timeout=10000)
 
-    # Step 3: If still not found, navigate to login page directly
+    # Step 3: If still not found, navigate to login page directly.
+    # Navigation may fail on flaky network or if the page redirects to
+    # geo-blocked content — log the concrete reason so the user can
+    # diagnose, then continue to the manual-browser fallback below.
     if not qrcode_found:
         logger.info("Trying direct navigation to login page...")
         try:
             await page.goto("https://www.xiaohongshu.com/login")
             await asyncio.sleep(3)
             qrcode_found = await _wait_for_any(page, _QRCODE_IMG_SELECTORS, timeout=10000)
-        except Exception:
-            pass
+        except _EXPECTED_PROBE_ERRORS as e:
+            logger.warning(
+                f"Direct login-page navigation failed ({type(e).__name__}: {e}); "
+                "falling back to manual browser interaction."
+            )
 
     if not qrcode_found:
         logger.warning(

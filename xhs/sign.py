@@ -13,7 +13,15 @@ import time
 from typing import Any, Dict, Optional, Union
 from urllib.parse import quote
 
-from playwright.async_api import Page
+from playwright.async_api import (
+    Page,
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+)
+
+import logging
+
+logger = logging.getLogger("xhs-mcp")
 
 
 # ── Custom Base64 ──
@@ -216,22 +224,41 @@ def _build_xs_common(a1: str, b1: str, x_s: str, x_t: str) -> str:
 # ── Playwright integration ──
 
 async def get_b1_from_localstorage(page: Page) -> str:
-    """Get b1 value from browser localStorage"""
+    """Get b1 value from browser localStorage.
+
+    Returns the empty string if localStorage is unavailable (e.g. page
+    navigated to a blank tab, context closed).  Playwright errors are
+    logged at WARNING so silent "no b1" failures are visible in logs.
+    Other errors propagate so callers notice genuinely broken state.
+    """
     try:
         local_storage = await page.evaluate("() => window.localStorage")
-        return local_storage.get("b1", "")
-    except Exception:
+        return local_storage.get("b1", "") if local_storage else ""
+    except (PlaywrightTimeoutError, PlaywrightError) as e:
+        logger.warning(f"Failed to read b1 from localStorage: {type(e).__name__}: {e}")
         return ""
 
 
 async def call_mnsv2(page: Page, sign_str: str, md5_str: str) -> str:
-    """Call window.mnsv2 via Playwright to generate signature"""
+    """Call window.mnsv2 via Playwright to generate signature.
+
+    Returns the empty string on signature failure (e.g. XHS changed
+    the JS hook name, page not fully loaded).  Playwright errors are
+    logged at WARNING — the caller (sign_request) can then decide
+    whether to reload the page and retry; silent empty returns used
+    to make these failures invisible.
+    """
     sign_str_escaped = sign_str.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
     md5_str_escaped = md5_str.replace("\\", "\\\\").replace("'", "\\'")
     try:
         result = await page.evaluate(f"window.mnsv2('{sign_str_escaped}', '{md5_str_escaped}')")
         return result if result else ""
-    except Exception:
+    except (PlaywrightTimeoutError, PlaywrightError) as e:
+        logger.warning(
+            f"window.mnsv2 signature call failed: {type(e).__name__}: {e}. "
+            "XHS may have changed their signature function name, or the page "
+            "isn't fully loaded. Consider reloading the browser context."
+        )
         return ""
 
 
@@ -260,6 +287,12 @@ async def sign_request(
     sign_str = _build_sign_string(uri, data, method)
     md5_str = _md5_hex(sign_str)
     x3_value = await call_mnsv2(page, sign_str, md5_str)
+    if not x3_value:
+        raise RuntimeError(
+            "Signature generation failed: window.mnsv2 returned empty. "
+            "The XHS page is not ready (stale or navigated) or the signing "
+            "function name has changed. Reload the browser context and retry."
+        )
     data_type = "object" if isinstance(data, (dict, list)) else "string"
     x_s = _build_xs_payload(x3_value, data_type)
 
