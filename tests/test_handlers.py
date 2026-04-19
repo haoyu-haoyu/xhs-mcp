@@ -150,6 +150,72 @@ async def test_search_per_keyword_error_reported_in_summary():
     assert payload["keyword_results"]["good"]["count"] == 0  # empty items
 
 
+@pytest.mark.asyncio
+async def test_search_does_not_cache_partial_failure():
+    """Regression: a keyword failing must not poison the 15-min cache for
+    the whole multi-keyword request on subsequent calls."""
+    import httpx
+
+    client = AsyncMock()
+
+    async def fake_search(keyword, page, sort, note_type):
+        if keyword == "bad":
+            raise httpx.ConnectError("boom")
+        return {"has_more": False, "items": []}
+
+    client.search_notes.side_effect = fake_search
+    cache = FakeCache()
+    ctx = _make_ctx(client=client, cache=cache)
+
+    await handlers.handle_xhs_search(ctx, {"keywords": ["bad", "good"]})
+    # Nothing should have been persisted because "bad" failed.
+    assert cache.store == {}
+
+
+@pytest.mark.asyncio
+async def test_search_cache_respects_keyword_order():
+    """Regression: ["a","b"] and ["b","a"] must NOT share a cache entry,
+    because the response `notes` list preserves caller-specified order.
+    If they aliased, whichever input hit the cache miss first would pin
+    the ordering for the other."""
+    client = AsyncMock()
+
+    async def fake_search(keyword, page, sort, note_type):
+        return {
+            "has_more": False,
+            "items": [{"id": keyword, "note_card": {"display_title": keyword}}],
+        }
+
+    client.search_notes.side_effect = fake_search
+    cache = FakeCache()
+    ctx = _make_ctx(client=client, cache=cache)
+
+    r1 = await handlers.handle_xhs_search(ctx, {"keywords": ["a", "b"]})
+    titles_1 = [n["title"] for n in _text_payload(r1)["notes"]]
+    r2 = await handlers.handle_xhs_search(ctx, {"keywords": ["b", "a"]})
+    titles_2 = [n["title"] for n in _text_payload(r2)["notes"]]
+    # Orders must differ — the second call must NOT be served from the
+    # first call's cache entry (would have returned ["a","b"]).
+    assert titles_1 == ["a", "b"]
+    assert titles_2 == ["b", "a"]
+
+
+@pytest.mark.asyncio
+async def test_search_deduplicates_keywords():
+    """Regression: duplicate keywords must collapse to a single search so
+    keyword_results isn't corrupted by overwrite, and we don't pay the
+    5-10s inter-keyword sleep for no reason."""
+    client = AsyncMock()
+    client.search_notes.return_value = {"has_more": False, "items": []}
+    ctx = _make_ctx(client=client)
+
+    resp = await handlers.handle_xhs_search(ctx, {"keywords": ["dup", "dup", "other"]})
+    payload = _text_payload(resp)
+    assert set(payload["keyword_results"].keys()) == {"dup", "other"}
+    # Only two underlying searches performed, not three.
+    assert client.search_notes.call_count == 2
+
+
 # ── xhs_detail ────────────────────────────────────────────────────────
 
 
@@ -176,6 +242,58 @@ async def test_detail_skips_empty_response_and_marks_failure():
     assert payload["summary"]["succeeded"] == 0
     assert payload["summary"]["failed"] == 1
     assert payload["summary"]["failed_details"][0]["error"] == "empty_response"
+
+
+@pytest.mark.asyncio
+async def test_detail_does_not_cache_on_comments_fetch_failure():
+    """Regression: if get_comments=True and the comments fetch fails, the
+    partial payload carrying comments_error must not be cached — otherwise
+    the empty comments would be served for the full 24h TTL."""
+    import httpx
+
+    client = AsyncMock()
+    client.get_note_by_id.return_value = {
+        "note_id": "n1",
+        "display_title": "t",
+        "user": {},
+        "interact_info": {},
+    }
+    client.get_note_all_comments.side_effect = httpx.ConnectError("boom")
+    cache = FakeCache()
+    ctx = _make_ctx(client=client, cache=cache)
+
+    await handlers.handle_xhs_detail(
+        ctx,
+        {"note_ids": ["n1"], "xsec_tokens": ["t1"], "get_comments": True},
+    )
+    assert cache.store == {}
+
+
+@pytest.mark.asyncio
+async def test_detail_does_not_cache_on_sub_comment_partial_failure():
+    """Regression: sub-comment pagination failure marks the parent comment
+    with _sub_comments_partial; the detail handler must not cache that
+    truncated tree for the 24h TTL."""
+    client = AsyncMock()
+    client.get_note_by_id.return_value = {
+        "note_id": "n1",
+        "display_title": "t",
+        "user": {},
+        "interact_info": {},
+    }
+    # Simulate the partial-failure marker that get_note_all_comments
+    # attaches when a sub-comment page raises mid-pagination.
+    client.get_note_all_comments.return_value = [
+        {"id": "c1", "content": "top", "user_info": {}, "_sub_comments_partial": True},
+    ]
+    cache = FakeCache()
+    ctx = _make_ctx(client=client, cache=cache)
+
+    await handlers.handle_xhs_detail(
+        ctx,
+        {"note_ids": ["n1"], "xsec_tokens": ["t1"], "get_comments": True},
+    )
+    assert cache.store == {}
 
 
 @pytest.mark.asyncio
@@ -235,6 +353,33 @@ async def test_creator_profile_then_notes_populates_expected_fields():
     assert c["recent_notes"][0]["note_id"] == "n1"
 
 
+@pytest.mark.asyncio
+async def test_creator_does_not_cache_on_notes_fetch_failure():
+    """Regression: if profile fetch succeeds but notes fetch fails, the
+    partial creator payload (with notes_error) must NOT be cached,
+    otherwise incomplete data sticks for the 7-day TTL."""
+    import httpx
+
+    client = AsyncMock()
+    client.get_creator_info.return_value = {
+        "basicInfo": {"nickname": "N"},
+        "interactions": [],
+    }
+    client.get_creator_notes.side_effect = httpx.ConnectError("notes boom")
+    cache = FakeCache()
+    ctx = _make_ctx(client=client, cache=cache)
+
+    resp = await handlers.handle_xhs_creator(
+        ctx, {"user_ids": ["u1"], "note_count": 1}
+    )
+    payload = _text_payload(resp)
+    # Response still returns what we have (graceful degrade).
+    assert payload["creators"][0]["nickname"] == "N"
+    assert "notes_error" in payload["creators"][0]
+    # But cache must be empty — a fresh call later should retry.
+    assert cache.store == {}
+
+
 # ── xhs_login ─────────────────────────────────────────────────────────
 
 
@@ -260,7 +405,9 @@ async def test_login_cookie_str_requires_non_empty_string():
 @pytest.mark.asyncio
 async def test_status_reports_browser_disconnected_when_not_started(monkeypatch, tmp_path):
     browser_mgr = SimpleNamespace(is_started=False, cookie_dict={})
-    ctx = handlers.HandlerContext(browser_mgr=browser_mgr)
+    # Use FakeCache so get_stats() doesn't list the project's real cache/
+    # directory (and get_stats()'s call to _cache_dir() doesn't mkdir one).
+    ctx = handlers.HandlerContext(browser_mgr=browser_mgr, cache_module=FakeCache())
 
     # Don't let the handler stat a real user cookies.json.
     monkeypatch.setattr(handlers.os.path, "exists", lambda p: False)

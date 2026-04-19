@@ -287,6 +287,12 @@ async def sign_request(
     sign_str = _build_sign_string(uri, data, method)
     md5_str = _md5_hex(sign_str)
     x3_value = await call_mnsv2(page, sign_str, md5_str)
+    if not x3_value:
+        raise RuntimeError(
+            "Signature generation failed: window.mnsv2 returned empty. "
+            "The XHS page is not ready (stale or navigated) or the signing "
+            "function name has changed. Reload the browser context and retry."
+        )
     data_type = "object" if isinstance(data, (dict, list)) else "string"
     x_s = _build_xs_payload(x3_value, data_type)
 

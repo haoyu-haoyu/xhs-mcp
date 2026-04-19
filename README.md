@@ -173,11 +173,11 @@ xhs_login(action="cookie_str", cookie_str="你的cookie字符串")
 - **备份 / 同步工具**（iCloud Drive、Dropbox、Time Machine）可能把明文 Cookie 复制到其他地方
 - **Windows 上 `os.chmod()` 只能切换只读位**，其他 Unix 权限位被忽略；真正的访问控制来自 NTFS ACL，需要你手动在资源管理器里限制文件权限
 
-如果介意明文存储，建议通过 `xhs_login` 的 `cookie_str` 方式从环境变量/密码管理器传入，不让工具自己保存。
+⚠️ **注意**：`xhs_login` 的 `cookie_str` 方式**仍会把导入的 Cookie 写入 `config/cookies.json`**（目前没有纯内存模式）。无论你从哪里读取 cookie 字符串，只要调用这个工具，都会落盘到本机。如果完全不想落盘，需要自行 patch `xhs/login.py` 里的 `login_by_cookie_str`，去掉 `save_cookies_to_cache()` 调用。
 
 ## 项目结构
 
-```
+```text
 xhs-mcp/
 ├── server.py              # MCP Server 入口，注册工具和调度
 ├── xhs/

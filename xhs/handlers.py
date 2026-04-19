@@ -23,12 +23,27 @@ import httpx
 from mcp.types import TextContent
 from playwright.async_api import Error as PlaywrightError
 
+from config.settings import COOKIE_CACHE_PATH
+
 from . import cache as request_cache
 from .browser import BrowserManager
 from .client import XHSClient
 from .login import check_cookie_valid, login_by_cookie_str, login_by_qrcode
 
 logger = logging.getLogger("xhs-mcp")
+
+
+def _cookie_cache_path() -> str:
+    """Absolute path to the cookie cache file.
+
+    Single source of truth — both handle_xhs_login (for cookie age) and
+    handle_xhs_status (for existence/age reporting) resolve through here
+    so an operator overriding ``COOKIE_CACHE_PATH`` in settings doesn't
+    get drift between the browser manager and the status tool.
+    """
+    return os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), COOKIE_CACHE_PATH
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -116,10 +131,13 @@ def format_search_note(item: dict) -> dict:
         ),
         "comment_count": interact_info.get("comment_count", note_card.get("comment_count", "0")),
         "share_count": interact_info.get("share_count", note_card.get("share_count", "0")),
-        "tag_list": [t.get("name", "") for t in note_card.get("tag_list", [])],
+        # `or []` coerces explicit null values to empty — `get(k, [])` only
+        # catches missing keys, not `"tag_list": null` / `"image_list": null`
+        # payloads that XHS occasionally returns.
+        "tag_list": [t.get("name", "") for t in (note_card.get("tag_list") or [])],
         "image_list": [
             img.get("url_default", img.get("url", ""))
-            for img in note_card.get("image_list", [])
+            for img in (note_card.get("image_list") or [])
         ],
         "note_url": f"https://www.xiaohongshu.com/explore/{item.get('id', '')}",
     }
@@ -153,10 +171,11 @@ def format_note_detail(note_card: dict) -> dict:
         ),
         "comment_count": interact_info.get("comment_count", note_card.get("comment_count", "0")),
         "share_count": interact_info.get("share_count", note_card.get("share_count", "0")),
-        "tag_list": [t.get("name", "") for t in note_card.get("tag_list", [])],
+        # Same null-vs-missing guard as format_search_note.
+        "tag_list": [t.get("name", "") for t in (note_card.get("tag_list") or [])],
         "image_list": [
             img.get("url_default", img.get("url", ""))
-            for img in note_card.get("image_list", [])
+            for img in (note_card.get("image_list") or [])
         ],
         "note_url": f"https://www.xiaohongshu.com/explore/{note_card.get('note_id', '')}",
     }
@@ -211,18 +230,38 @@ async def handle_xhs_search(ctx: HandlerContext, arguments: dict) -> list[TextCo
     Supports multiple keywords with 5-10s gap between different keywords.
     Each API request has 2-5s random interval.
     """
-    keywords: List[str] = arguments.get("keywords", [])
+    raw_keywords: List[str] = arguments.get("keywords", [])
     sort: str = arguments.get("sort", "general")
     page: int = arguments.get("page", 1)
     note_type: int = arguments.get("note_type", 0)
     force_refresh: bool = arguments.get("force_refresh", False)
 
-    if not keywords:
+    if not raw_keywords:
         return error_response("invalid_params", "keywords is required and cannot be empty")
 
-    # Cache: check whole-call cache (all keywords + params combined)
+    # De-duplicate while preserving first-seen order.  keyword_results
+    # below is keyed by the raw keyword, so duplicates would overwrite
+    # each other and hide mixed success/failure outcomes.  De-duping up
+    # front also avoids the needless 5-10s gap between identical searches.
+    seen: set = set()
+    keywords: List[str] = []
+    for kw in raw_keywords:
+        if kw not in seen:
+            seen.add(kw)
+            keywords.append(kw)
+    if len(keywords) != len(raw_keywords):
+        logger.info(
+            f"xhs_search: collapsed {len(raw_keywords)} input keywords to "
+            f"{len(keywords)} unique (duplicates ignored)."
+        )
+
+    # Cache: check whole-call cache (all keywords + params combined).
+    # Use the order-preserving deduped list — `notes` below is built in
+    # caller-specified keyword order, so collapsing ["b","a"] and ["a","b"]
+    # to the same cache entry would serve notes back in the wrong order
+    # for whichever input-order missed the cache second.
     cache_params = {
-        "keywords": sorted(keywords),
+        "keywords": keywords,
         "sort": sort,
         "page": page,
         "note_type": note_type,
@@ -240,6 +279,11 @@ async def handle_xhs_search(ctx: HandlerContext, arguments: dict) -> list[TextCo
 
     all_notes: List[dict] = []
     keyword_results: Dict[str, dict] = {}
+    # Track failure independently of keyword_results — the dict is keyed by
+    # the raw keyword, so duplicate keywords would collapse (a later
+    # success overwriting an earlier failure) and hide a real failure from
+    # the cache gate below.
+    had_failure = False
 
     for i, keyword in enumerate(keywords):
         try:
@@ -264,13 +308,17 @@ async def handle_xhs_search(ctx: HandlerContext, arguments: dict) -> list[TextCo
             }
             all_notes.extend(notes)
 
-        except (httpx.HTTPError, PlaywrightError, KeyError, ValueError) as e:
+        except (httpx.HTTPError, PlaywrightError, KeyError, ValueError, RuntimeError) as e:
+            # RuntimeError covers sign_request failing with a stale
+            # window.mnsv2; we want that to degrade per-keyword rather
+            # than abort the whole search as internal_error.
             logger.error(f"Search failed for keyword '{keyword}': {type(e).__name__}: {e}")
             keyword_results[keyword] = {
                 "count": 0,
                 "has_more": False,
                 "error": f"{type(e).__name__}: {e}",
             }
+            had_failure = True
 
         # 5-10s gap between different keywords (not after the last one)
         if i < len(keywords) - 1:
@@ -284,8 +332,13 @@ async def handle_xhs_search(ctx: HandlerContext, arguments: dict) -> list[TextCo
         "keyword_results": keyword_results,
     }
 
-    # Write to cache
-    ctx.cache_module.put("xhs_search", cache_params, result)
+    # Only cache when every attempted keyword succeeded.  The cache key
+    # is the full multi-keyword request, so storing a partially-failed
+    # result would make the failed keywords sticky for the 15-minute TTL
+    # on identical follow-up calls.  Cache-miss + re-fetch on partial
+    # failure is a better trade-off than serving stale error entries.
+    if not had_failure and keyword_results:
+        ctx.cache_module.put("xhs_search", cache_params, result)
 
     return json_response(result)
 
@@ -359,8 +412,23 @@ async def handle_xhs_detail(ctx: HandlerContext, arguments: dict) -> list[TextCo
                         xsec_token=xsec_token,
                         max_count=comment_count,
                     )
+                    # Propagate partial-fetch signal from sub-comment pagination
+                    # so the cache gate below can skip writes that would
+                    # otherwise serve truncated comment trees for 24h.
+                    # `(c or {})` mirrors format_comment()'s None-tolerance —
+                    # XHS occasionally returns null comment slots.
+                    if any((c or {}).get("_sub_comments_partial") for c in raw_comments):
+                        formatted["comments_partial"] = True
                     formatted["comments"] = [format_comment(c) for c in raw_comments]
-                except (httpx.HTTPError, PlaywrightError, KeyError, ValueError) as ce:
+                except (
+                    httpx.HTTPError,
+                    PlaywrightError,
+                    KeyError,
+                    ValueError,
+                    RuntimeError,
+                ) as ce:
+                    # RuntimeError: sign_request() on a stale page.
+                    # Keep the note we already fetched; drop just comments.
                     logger.warning(
                         f"Failed to get comments for {note_id}: {type(ce).__name__}: {ce}"
                     )
@@ -369,9 +437,22 @@ async def handle_xhs_detail(ctx: HandlerContext, arguments: dict) -> list[TextCo
 
             notes.append(formatted)
             succeeded.append(note_id)
-            ctx.cache_module.put("xhs_detail", note_cache_params, formatted)
+            # Only cache a fully-successful detail.  `comments_error`
+            # signals a top-level comments fetch failure (empty comments
+            # + error key).  `comments_partial` signals a sub-comment
+            # pagination failure (top-level comments present but at
+            # least one branch truncated).  Either case serves stale /
+            # incomplete data for the full 24h TTL if cached.
+            if (
+                "comments_error" not in formatted
+                and "comments_partial" not in formatted
+            ):
+                ctx.cache_module.put("xhs_detail", note_cache_params, formatted)
 
-        except (httpx.HTTPError, PlaywrightError, KeyError, ValueError) as e:
+        except (httpx.HTTPError, PlaywrightError, KeyError, ValueError, RuntimeError) as e:
+            # RuntimeError: sign_request() on a stale page. Treat per-note
+            # the same as a network error so other notes in the batch still
+            # have a chance to succeed.
             logger.error(f"Failed to get detail for {note_id}: {type(e).__name__}: {e}")
             failed.append({"note_id": note_id, "error": f"{type(e).__name__}: {e}"})
 
@@ -465,6 +546,11 @@ async def handle_xhs_creator(ctx: HandlerContext, arguments: dict) -> list[TextC
             else:
                 creator_data["profile_error"] = "Could not parse profile page"
         except (httpx.HTTPError, PlaywrightError, KeyError, ValueError) as e:
+            # No RuntimeError catch here: get_creator_info() is a plain
+            # HTML GET with no sign_request() call on the path, so a
+            # RuntimeError from this block would indicate an unrelated
+            # logic bug and should surface rather than get silently
+            # downgraded to profile_error.
             logger.error(f"Failed to get creator info for {user_id}: {type(e).__name__}: {e}")
             creator_data["profile_error"] = f"{type(e).__name__}: {e}"
 
@@ -490,12 +576,19 @@ async def handle_xhs_creator(ctx: HandlerContext, arguments: dict) -> list[TextC
                     "note_url": f"https://www.xiaohongshu.com/explore/{note.get('note_id', '')}",
                 })
             creator_data["recent_notes"] = recent_notes
-        except (httpx.HTTPError, PlaywrightError, KeyError, ValueError) as e:
+        except (httpx.HTTPError, PlaywrightError, KeyError, ValueError, RuntimeError) as e:
+            # RuntimeError: sign_request() on a stale page. Degrade to
+            # empty notes list + notes_error so the profile is still
+            # returned.
             logger.error(f"Failed to get notes for creator {user_id}: {type(e).__name__}: {e}")
             creator_data["notes_error"] = f"{type(e).__name__}: {e}"
             creator_data["recent_notes"] = []
 
-        if "profile_error" not in creator_data:
+        # Only cache when both profile AND recent-notes fetches succeeded.
+        # Partial failure (profile OK but notes_error set) otherwise sticks
+        # for the full 7-day TTL and serves an incomplete payload on every
+        # subsequent call for the same user_id/note_count.
+        if "profile_error" not in creator_data and "notes_error" not in creator_data:
             ctx.cache_module.put("xhs_creator", user_cache_params, creator_data)
 
         creators.append(creator_data)
@@ -519,9 +612,7 @@ async def handle_xhs_login(ctx: HandlerContext, arguments: dict) -> list[TextCon
     browser_mgr = ctx.browser_mgr
 
     def _cookie_age_hours() -> Optional[float]:
-        cache_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "config", "cookies.json"
-        )
+        cache_path = _cookie_cache_path()
         if not os.path.exists(cache_path):
             return None
         return round((time.time() - os.path.getmtime(cache_path)) / 3600, 1)
@@ -649,9 +740,7 @@ async def handle_xhs_status(ctx: HandlerContext, arguments: dict) -> list[TextCo
     result["cache_entries"] = cache_stats["cache_entries"]
     result["cache_size_mb"] = cache_stats["cache_size_mb"]
 
-    cookie_cache = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)), "config", "cookies.json"
-    )
+    cookie_cache = _cookie_cache_path()
     result["cookie_cache_exists"] = os.path.exists(cookie_cache)
     if os.path.exists(cookie_cache):
         mtime = os.path.getmtime(cookie_cache)

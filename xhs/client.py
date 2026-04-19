@@ -182,13 +182,20 @@ class XHSClient:
             if response.status_code == 200:
                 result = response.json()
                 # Defensive against payloads where nested fields are None
-                # instead of missing — e.g. {"data": null} would otherwise
-                # raise AttributeError on the chained .get() and surface as
+                # OR the wrong type — e.g. {"data": null}, {"data": []}, or
+                # {"data": "some string"} would otherwise raise
+                # AttributeError on the chained .get() and surface as
                 # internal_error in xhs_login(check) instead of "expired".
+                # `or {}` alone handles None/[] (falsy), but a truthy
+                # non-dict (e.g. a populated list) still has no .get().
                 if not isinstance(result, dict):
                     return False
-                data = result.get("data") or {}
-                inner = data.get("result") or {}
+                data = result.get("data")
+                if not isinstance(data, dict):
+                    return False
+                inner = data.get("result")
+                if not isinstance(inner, dict):
+                    return False
                 return bool(inner.get("success"))
         except (httpx.HTTPError, ValueError) as e:
             # httpx.HTTPError covers connect/read/timeout; ValueError covers
@@ -311,6 +318,17 @@ class XHSClient:
             if not comments:
                 break
 
+            # Drop null / non-dict slots BEFORE trimming and extending.
+            # XHS occasionally returns `{"comments": [None, ...]}`; keeping
+            # None entries would (a) consume a max_count slot, (b) leak
+            # non-dicts into the List[Dict] return type, and (c) make
+            # `comment.get(...)` raise AttributeError further down,
+            # aborting the whole detail fetch instead of degrading
+            # per-note.
+            comments = [c for c in comments if isinstance(c, dict)]
+            if not comments:
+                break
+
             # Trim to max_count
             remaining = max_count - len(result)
             comments = comments[:remaining]
@@ -342,17 +360,25 @@ class XHSClient:
                         KeyError,
                         AttributeError,
                         TypeError,
+                        RuntimeError,
                     ) as e:
                         # Paginated fetch failure on a single sub-comment page
                         # stops the sub-walk but the outer comment is kept with
                         # whatever pages we already have.  AttributeError /
                         # TypeError guard against unexpected shapes returned
-                        # by XHS (e.g. a list instead of a dict); we'd rather
-                        # drop sub-comments than abort the whole detail fetch.
+                        # by XHS (e.g. a list instead of a dict); RuntimeError
+                        # covers sign_request() failing on a stale page — we'd
+                        # rather drop sub-comments than abort the whole detail
+                        # fetch.  Mark the parent comment as partial so the
+                        # caller knows not to cache this as a final "complete"
+                        # result; otherwise one transient signing blip would
+                        # pin truncated sub-comments for the full xhs_detail
+                        # TTL.
                         logger.warning(
                             f"Failed to get sub-comments for {root_id}: "
                             f"{type(e).__name__}: {e}"
                         )
+                        comment["_sub_comments_partial"] = True
                         break
 
                 comment["sub_comments"] = sub_comments
