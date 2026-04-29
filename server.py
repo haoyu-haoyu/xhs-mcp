@@ -161,18 +161,21 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Manage Xiaohongshu login. Use action=check to verify, "
                 "action=qrcode to scan QR code (opens visible browser), "
-                "action=cookie_str to import cookies."
+                "action=cookie_str to import cookies, action=from_browser "
+                "to pull a live logged-in session from a real installed "
+                "browser (Chrome / Edge / Brave)."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["check", "qrcode", "cookie_str"],
+                        "enum": ["check", "qrcode", "cookie_str", "from_browser"],
                         "default": "check",
                         "description": (
                             "Login action: check (verify current state), "
-                            "qrcode (scan to login), cookie_str (import cookie string)"
+                            "qrcode (scan to login), cookie_str (import cookie "
+                            "string), from_browser (extract from real browser)"
                         ),
                     },
                     "cookie_str": {
@@ -181,6 +184,25 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "Cookie string from browser devtools "
                             "(only for action=cookie_str)"
+                        ),
+                    },
+                    "browser": {
+                        "type": "string",
+                        "enum": ["chrome", "edge", "brave", "chromium"],
+                        "default": "chrome",
+                        "description": (
+                            "Source browser for action=from_browser. "
+                            "Defaults to chrome."
+                        ),
+                    },
+                    "profile": {
+                        "type": "string",
+                        "default": "",
+                        "description": (
+                            "Specific Chromium profile name (e.g. 'Default', "
+                            "'Profile 1') for action=from_browser. Empty = "
+                            "auto-pick the profile with a real logged-in xhs "
+                            "session."
                         ),
                     },
                 },

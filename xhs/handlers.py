@@ -28,7 +28,13 @@ from config.settings import COOKIE_CACHE_PATH
 from . import cache as request_cache
 from .browser import BrowserManager
 from .client import XHSClient
-from .login import check_cookie_valid, login_by_cookie_str, login_by_qrcode
+from .cookie_import import CookieImportError
+from .login import (
+    check_cookie_valid,
+    login_by_cookie_str,
+    login_by_qrcode,
+    login_from_browser,
+)
 
 logger = logging.getLogger("xhs-mcp")
 
@@ -605,10 +611,15 @@ async def handle_xhs_login(ctx: HandlerContext, arguments: dict) -> list[TextCon
     Actions:
     - check: Verify current cookie validity
     - qrcode: Open visible browser for QR code scan
-    - cookie_str: Import cookies from string
+    - cookie_str: Import cookies from a copied cookie string
+    - from_browser: Pull a live logged-in session from a real installed
+      browser (Chrome / Edge / Brave / Chromium).  Bypasses XHS's
+      Playwright fingerprint downgrade.
     """
     action: str = arguments.get("action", "check")
     cookie_str: str = arguments.get("cookie_str", "")
+    browser_name: str = arguments.get("browser", "chrome")
+    profile: Optional[str] = arguments.get("profile") or None
     browser_mgr = ctx.browser_mgr
 
     def _cookie_age_hours() -> Optional[float]:
@@ -698,10 +709,42 @@ async def handle_xhs_login(ctx: HandlerContext, arguments: dict) -> list[TextCon
                 "login_failed", f"Cookie import failed: {type(e).__name__}: {e}"
             )
 
+    elif action == "from_browser":
+        try:
+            if not browser_mgr.is_started:
+                await browser_mgr.start()
+
+            count = await login_from_browser(browser_mgr, browser=browser_name, profile=profile)
+            is_valid = await check_cookie_valid(browser_mgr)
+            return json_response({
+                "status": "valid" if is_valid else "expired",
+                "message": (
+                    f"Imported {count} cookies from {browser_name}"
+                    + (f" / {profile}" if profile else "")
+                    + (
+                        " — verified logged-in."
+                        if is_valid
+                        else " — but verification failed; the browser may be "
+                        "showing a guest session for xhs."
+                    )
+                ),
+                "cookie_count": count,
+            })
+        except CookieImportError as e:
+            # No usable cookies found — a 4xx-equivalent caller error
+            # rather than an internal failure: the user just needs to
+            # log in to xhs in the target browser first.
+            return error_response("import_failed", str(e))
+        except (PlaywrightError, OSError, RuntimeError, ValueError) as e:
+            return error_response(
+                "login_failed",
+                f"from_browser login failed: {type(e).__name__}: {e}",
+            )
+
     else:
         return error_response(
             "invalid_params",
-            f"Unknown action: {action}. Use check, qrcode, or cookie_str.",
+            f"Unknown action: {action}. Use check, qrcode, cookie_str, or from_browser.",
         )
 
 

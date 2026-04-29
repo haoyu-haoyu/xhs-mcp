@@ -8,6 +8,7 @@
 
 import asyncio
 import logging
+from typing import Optional
 
 from playwright.async_api import (
     BrowserContext,
@@ -235,6 +236,41 @@ async def login_by_cookie_str(browser_mgr: BrowserManager, cookie_str: str) -> b
         return True
 
     return False
+
+
+async def login_from_browser(
+    browser_mgr: BrowserManager,
+    browser: str = "chrome",
+    profile: Optional[str] = None,
+) -> int:
+    """Import a live xhs login session from a real installed browser.
+
+    Bypasses the QR-scan flow entirely.  XHS frequently downgrades the
+    `web_session` cookie produced by a Playwright-driven QR scan to a
+    guest session because the Playwright fingerprint differs from a
+    real user agent — cookies pulled from a real browser carry the
+    matching fingerprint and stay logged-in.
+
+    Returns the number of cookies imported.  Raises CookieImportError
+    via the underlying ``import_cookies_from_browser`` if no usable
+    cookies are available (browser not installed / not logged in /
+    decryption blocked by Keychain prompt denial).
+    """
+    from .cookie_import import import_cookies_from_browser
+
+    cookies_to_set = import_cookies_from_browser(browser=browser, profile=profile)
+    context = browser_mgr.browser_context
+
+    # Clear any stale guest-session cookies that the Playwright context
+    # picked up from previous navigation; otherwise add_cookies merges
+    # and the broken web_session can shadow the freshly imported one.
+    await context.clear_cookies()
+    await context.add_cookies(cookies_to_set)
+    await browser_mgr.reload_page()
+    await browser_mgr.refresh_cookies()
+    await browser_mgr.save_cookies_to_cache()
+    logger.info(f"Imported {len(cookies_to_set)} cookies from {browser}.")
+    return len(cookies_to_set)
 
 
 async def check_cookie_valid(browser_mgr: BrowserManager) -> bool:
