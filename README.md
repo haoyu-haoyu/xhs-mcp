@@ -51,7 +51,7 @@ git clone https://github.com/haoyu-haoyu/xhs-mcp.git
 cd xhs-mcp
 
 # 2. 安装 Python 依赖
-pip install mcp playwright httpx tenacity
+pip install mcp playwright httpx tenacity xhshow
 
 # 3. 安装 Playwright 浏览器
 playwright install chromium

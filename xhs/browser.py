@@ -97,7 +97,8 @@ class BrowserManager:
         # Try to load cached cookies before navigating
         await self._load_cookies_from_cache()
 
-        # Navigate to XHS so window.mnsv2 becomes available
+        # Navigate to XHS so the page can establish a real session
+        # (e.g. set webId / acw_tc cookies) used by the xhshow signer.
         await self._page.goto(XHS_INDEX_URL)
         logger.info(f"Navigated to {XHS_INDEX_URL}")
 
@@ -261,7 +262,7 @@ class BrowserManager:
             return False
 
     async def reload_page(self) -> None:
-        """Reload the XHS page to refresh window.mnsv2 (e.g. after signature failure)."""
+        """Reload the XHS page to refresh the browser session cookies."""
         if self._page:
             await self._page.reload()
             logger.info("Page reloaded.")

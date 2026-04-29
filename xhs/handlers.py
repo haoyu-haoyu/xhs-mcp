@@ -309,9 +309,9 @@ async def handle_xhs_search(ctx: HandlerContext, arguments: dict) -> list[TextCo
             all_notes.extend(notes)
 
         except (httpx.HTTPError, PlaywrightError, KeyError, ValueError, RuntimeError) as e:
-            # RuntimeError covers sign_request failing with a stale
-            # window.mnsv2; we want that to degrade per-keyword rather
-            # than abort the whole search as internal_error.
+            # Per-keyword degrade: a single keyword failing (network blip,
+            # signing edge case, malformed payload) shouldn't abort the
+            # whole multi-keyword search as internal_error.
             logger.error(f"Search failed for keyword '{keyword}': {type(e).__name__}: {e}")
             keyword_results[keyword] = {
                 "count": 0,
@@ -427,7 +427,7 @@ async def handle_xhs_detail(ctx: HandlerContext, arguments: dict) -> list[TextCo
                     ValueError,
                     RuntimeError,
                 ) as ce:
-                    # RuntimeError: sign_request() on a stale page.
+                    # Defensive catch-all (HTTP / Playwright / parse / runtime).
                     # Keep the note we already fetched; drop just comments.
                     logger.warning(
                         f"Failed to get comments for {note_id}: {type(ce).__name__}: {ce}"
