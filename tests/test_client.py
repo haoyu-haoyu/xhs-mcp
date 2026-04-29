@@ -59,3 +59,33 @@ async def test_get_note_all_comments_skips_null_comment_slots():
     # survives and the return type stays List[Dict].
     assert len(result) == 1
     assert result[0]["id"] == "c1"
+
+
+@pytest.mark.asyncio
+async def test_search_notes_payload_includes_required_fields():
+    """Regression: xhs silently returns an empty result set
+    (data omits `items`) when /search/notes is called without
+    ``ext_flags`` or ``image_formats``.  The request still signs and
+    returns code:0, success:true — so the failure is invisible without
+    pinning the payload here."""
+    browser_mgr = SimpleNamespace(page=None, cookie_dict={})
+    client = XHSClient(browser_mgr)
+
+    captured: dict = {}
+
+    async def fake_post(uri, data):
+        captured["uri"] = uri
+        captured["data"] = data
+        return {"items": [], "has_more": False}
+
+    client._post = fake_post  # type: ignore[assignment]
+
+    await client.search_notes("减脂", page=1, page_size=20)
+    assert captured["uri"] == "/api/sns/web/v1/search/notes"
+    sent = captured["data"]
+    assert sent.get("ext_flags") == []
+    assert sent.get("image_formats") == ["jpg", "webp", "avif"]
+    # Plus the original required fields, just to be sure the new
+    # additions didn't displace anything.
+    for k in ("keyword", "page", "page_size", "search_id", "sort", "note_type"):
+        assert k in sent

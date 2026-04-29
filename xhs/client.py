@@ -221,6 +221,13 @@ class XHSClient:
             "search_id": _get_search_id(),
             "sort": sort,
             "note_type": note_type,
+            # xhs silently returns an empty result set if these two
+            # fields are absent — the request is signed and accepted
+            # (code:0, success:true) but `data.items` is omitted.
+            # Confirmed against the live web bundle 2026-04: scroll-load
+            # /search/notes always carries them.
+            "ext_flags": [],
+            "image_formats": ["jpg", "webp", "avif"],
         }
         return await self._post(uri, data)
 

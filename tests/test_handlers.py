@@ -399,6 +399,45 @@ async def test_login_cookie_str_requires_non_empty_string():
     assert payload["error"] == "invalid_params"
 
 
+@pytest.mark.asyncio
+async def test_login_from_browser_reports_import_failed_on_no_login(monkeypatch):
+    """CookieImportError (e.g. user not logged in) must surface as
+    import_failed, not as a generic internal error — the user should see
+    actionable guidance."""
+    from xhs.cookie_import import CookieImportError
+
+    async def fake_login_from_browser(*args, **kwargs):
+        raise CookieImportError(
+            "No xiaohongshu.com cookies found in any chrome profile..."
+        )
+
+    monkeypatch.setattr(handlers, "login_from_browser", fake_login_from_browser)
+    ctx = _make_ctx(client=AsyncMock())
+    resp = await handlers.handle_xhs_login(ctx, {"action": "from_browser", "browser": "chrome"})
+    payload = _text_payload(resp)
+    assert payload["error"] == "import_failed"
+    assert "xiaohongshu.com" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_login_from_browser_returns_valid_when_pong_succeeds(monkeypatch):
+    async def fake_login_from_browser(_mgr, browser, profile):
+        assert browser == "chrome"
+        assert profile is None
+        return 16  # 16 cookies imported
+
+    async def fake_check(_mgr):
+        return True
+
+    monkeypatch.setattr(handlers, "login_from_browser", fake_login_from_browser)
+    monkeypatch.setattr(handlers, "check_cookie_valid", fake_check)
+    ctx = _make_ctx(client=AsyncMock())
+    resp = await handlers.handle_xhs_login(ctx, {"action": "from_browser", "browser": "chrome"})
+    payload = _text_payload(resp)
+    assert payload["status"] == "valid"
+    assert payload["cookie_count"] == 16
+
+
 # ── xhs_status ────────────────────────────────────────────────────────
 
 
