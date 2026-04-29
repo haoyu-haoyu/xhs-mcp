@@ -79,9 +79,7 @@ class XHSClient:
         return headers
 
     async def _pre_headers(self, uri: str, params: Optional[Dict] = None, payload: Optional[Dict] = None) -> Dict:
-        """Sign request headers using Playwright injection."""
-        a1 = self._browser.cookie_dict.get("a1", "")
-
+        """Sign request headers via xhshow (pure-Python, no browser hook)."""
         if params is not None:
             data = params
             method = "GET"
@@ -91,20 +89,20 @@ class XHSClient:
         else:
             raise ValueError("params or payload is required")
 
-        signs = await sign_request(
-            page=self._browser.page,
+        signs = sign_request(
             uri=uri,
+            cookies=self._browser.cookie_dict,
             data=data,
-            a1=a1,
             method=method,
         )
 
         headers = self._get_headers()
         headers.update({
             "X-S": signs["x-s"],
-            "X-T": signs["x-t"],
+            "X-T": str(signs["x-t"]),
             "x-S-Common": signs["x-s-common"],
             "X-B3-Traceid": signs["x-b3-traceid"],
+            "X-Xray-TraceId": signs["x-xray-traceid"],
         })
         return headers
 
@@ -367,13 +365,13 @@ class XHSClient:
                         # whatever pages we already have.  AttributeError /
                         # TypeError guard against unexpected shapes returned
                         # by XHS (e.g. a list instead of a dict); RuntimeError
-                        # covers sign_request() failing on a stale page — we'd
-                        # rather drop sub-comments than abort the whole detail
-                        # fetch.  Mark the parent comment as partial so the
-                        # caller knows not to cache this as a final "complete"
-                        # result; otherwise one transient signing blip would
-                        # pin truncated sub-comments for the full xhs_detail
-                        # TTL.
+                        # is a defensive catch-all for unexpected runtime
+                        # failures from downstream layers.  We'd rather drop
+                        # sub-comments than abort the whole detail fetch.
+                        # Mark the parent comment as partial so the caller
+                        # knows not to cache this as a final "complete" result;
+                        # otherwise one transient blip would pin truncated
+                        # sub-comments for the full xhs_detail TTL.
                         logger.warning(
                             f"Failed to get sub-comments for {root_id}: "
                             f"{type(e).__name__}: {e}"
